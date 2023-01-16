@@ -1,174 +1,82 @@
 const std = @import("std");
-const http = @import("deps.zig").imports.apple_pie;
-const install = @import("build_capy.zig").install;
 
-/// Step used to run a web server
-const WebServerStep = struct {
-    step: std.build.Step,
-    exe: *std.build.LibExeObjStep,
-    builder: *std.build.Builder,
+const pkg = std.build.Pkg{
+    .name = "capy",
+    .source = std.build.FileSource{ .path = THIS_DIR ++ "/src/main.zig" },
+    .dependencies = &.{zigimg},
+};
 
-    pub fn create(builder: *std.build.Builder, exe: *std.build.LibExeObjStep) *WebServerStep {
-        const self = builder.allocator.create(WebServerStep) catch unreachable;
-        self.* = .{
-            .step = std.build.Step.init(.custom, "webserver", builder.allocator, WebServerStep.make),
-            .exe = exe,
-            .builder = builder,
-        };
-        return self;
-    }
-
-    const Context = struct {
-        exe: *std.build.LibExeObjStep,
-        builder: *std.build.Builder,
-    };
-
-    pub fn make(step: *std.build.Step) !void {
-        const self = @fieldParentPtr(WebServerStep, "step", step);
-        const allocator = self.builder.allocator;
-
-        var context = Context{ .builder = self.builder, .exe = self.exe };
-        const builder = http.router.Builder(*Context);
-        std.debug.print("Web server opened at http://localhost:8080/\n", .{});
-        try http.listenAndServe(
-            allocator,
-            try std.net.Address.parseIp("127.0.0.1", 8080),
-            &context,
-            comptime http.router.Router(*Context, &.{
-                builder.get("/", index),
-                builder.get("/capy.js", indexJs),
-                builder.get("/zig-app.wasm", wasmFile),
-            }),
-        );
-    }
-
-    fn index(context: *Context, response: *http.Response, request: http.Request) !void {
-        const allocator = request.arena;
-        const buildRoot = context.builder.build_root;
-        const file = try std.fs.cwd().openFile(try std.fs.path.join(allocator, &.{ buildRoot, "src/backends/wasm/index.html" }), .{});
-        defer file.close();
-        const text = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-
-        try response.headers.put("Content-Type", "text/html");
-        try response.writer().writeAll(text);
-    }
-
-    fn indexJs(context: *Context, response: *http.Response, request: http.Request) !void {
-        const allocator = request.arena;
-        const buildRoot = context.builder.build_root;
-        const file = try std.fs.cwd().openFile(try std.fs.path.join(allocator, &.{ buildRoot, "src/backends/wasm/capy.js" }), .{});
-        defer file.close();
-        const text = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-
-        try response.headers.put("Content-Type", "application/javascript");
-        try response.writer().writeAll(text);
-    }
-
-    fn wasmFile(context: *Context, response: *http.Response, request: http.Request) !void {
-        const allocator = request.arena;
-        const path = context.exe.getOutputSource().getPath(context.builder);
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
-        const text = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-
-        try response.headers.put("Content-Type", "application/wasm");
-        try response.writer().writeAll(text);
-    }
+const zigimg = std.build.Pkg{
+    .name = "zigimg",
+    .source = std.build.FileSource{ .path = @import("root").dependencies.build_root.zigimg ++ "/zigimg.zig" },
 };
 
 pub fn build(b: *std.build.Builder) !void {
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
 
-    var examplesDir = try std.fs.cwd().openIterableDir("examples", .{});
-    defer examplesDir.close();
-
-    const broken = switch (target.getOsTag()) {
-        .windows => &[_][]const u8{ "osm-viewer", "fade" },
-        else => &[_][]const u8{"osm-viewer"},
-    };
-
-    var walker = try examplesDir.walk(b.allocator);
-    defer walker.deinit();
-    while (try walker.next()) |entry| {
-        if (entry.kind == .File and std.mem.eql(u8, std.fs.path.extension(entry.path), ".zig")) {
-            const name = try std.mem.replaceOwned(u8, b.allocator, entry.path[0 .. entry.path.len - 4], std.fs.path.sep_str, "-");
-            defer b.allocator.free(name);
-
-            // it is not freed as the path is used later for building
-            const programPath = b.pathJoin(&.{ "examples", entry.path });
-
-            const exe: *std.build.LibExeObjStep = if (target.toTarget().isWasm())
-                b.addSharedLibrary(name, programPath, .unversioned)
-            else
-                b.addExecutable(name, programPath);
-            exe.setTarget(target);
-            exe.setBuildMode(mode);
-            try install(exe, .{});
-
-            const install_step = b.addInstallArtifact(exe);
-            const working = blk: {
-                for (broken) |broken_name| {
-                    if (std.mem.eql(u8, name, broken_name))
-                        break :blk false;
-                }
-                break :blk true;
-            };
-            if (working) {
-                b.getInstallStep().dependOn(&install_step.step);
-            } else {
-                std.log.warn("'{s}' is broken (disabled by default)", .{name});
-            }
-
-            if (target.toTarget().isWasm()) {
-                if (@import("builtin").zig_backend != .stage2_llvm) {
-                    const serve = WebServerStep.create(b, exe);
-                    serve.step.dependOn(&exe.install_step.?.step);
-                    const serve_step = b.step(name, "Start a web server to run this example");
-                    serve_step.dependOn(&serve.step);
-                }
-            } else {
-                const run_cmd = exe.run();
-                run_cmd.step.dependOn(&exe.install_step.?.step);
-                if (b.args) |args| {
-                    run_cmd.addArgs(args);
-                }
-
-                const run_step = b.step(name, "Run this example");
-                run_step.dependOn(&run_cmd.step);
-            }
-        }
-    }
-
-    const lib = b.addSharedLibrary("capy", "src/c_api.zig", b.version(0, 3, 0));
+    const lib = b.addStaticLibrary("capy", null);
     lib.setTarget(target);
     lib.setBuildMode(mode);
     lib.linkLibC();
-    try install(lib, .{});
-    // lib.emit_h = true;
     lib.install();
 
-    const sharedlib_install_step = b.addInstallArtifact(lib);
-    b.getInstallStep().dependOn(&sharedlib_install_step.step);
+    switch (lib.target.getOsTag()) {
+        .windows => {
+            switch (lib.build_mode) {
+                .Debug => lib.subsystem = .Console,
+                else => lib.subsystem = .Windows,
+            }
+            lib.linkSystemLibrary("comctl32");
+            lib.linkSystemLibrary("gdi32");
+            lib.linkSystemLibrary("gdiplus");
+            switch (lib.target.toTarget().cpu.arch) {
+                .x86_64 => lib.addObjectFile("src/backends/win32/res/x86_64.o"),
+                //.i386 => lib.addObjectFile(prefix ++ "/src/backends/win32/res/i386.o"), // currently disabled due to problems with safe SEH
+                else => {}, // not much of a problem as it'll just lack styling
+            }
+        },
+        .macos => {
+            if (@import("builtin").os.tag != .macos) {
+                const sdk_root_dir = b.pathFromRoot("macos-sdk/");
+                const sdk_framework_dir = std.fs.path.join(b.allocator, &.{ sdk_root_dir, "System/Library/Frameworks" }) catch unreachable;
+                const sdk_include_dir = std.fs.path.join(b.allocator, &.{ sdk_root_dir, "usr/include" }) catch unreachable;
+                const sdk_lib_dir = std.fs.path.join(b.allocator, &.{ sdk_root_dir, "usr/lib" }) catch unreachable;
+                lib.addFrameworkPath(sdk_framework_dir);
+                lib.addSystemIncludePath(sdk_include_dir);
+                lib.addLibraryPath(sdk_lib_dir);
+            }
 
-    const buildc_step = b.step("shared", "Build capy as a shared library (with C ABI)");
-    buildc_step.dependOn(&lib.install_step.?.step);
-
-    const tests = b.addTest("src/main.zig");
-    tests.setTarget(target);
-    tests.setBuildMode(mode);
-    // tests.emit_docs = .emit;
-    try install(tests, .{});
-
-    const test_step = b.step("test", "Run unit tests and also generate the documentation");
-    test_step.dependOn(&tests.step);
-
-    const coverage_tests = b.addTest("src/main.zig");
-    coverage_tests.setTarget(target);
-    coverage_tests.setBuildMode(mode);
-    coverage_tests.exec_cmd_args = &.{ "kcov", "--clean", "--include-pattern=src/", "kcov-output", null };
-    try install(coverage_tests, .{});
-
-    const cov_step = b.step("coverage", "Perform code coverage of unit tests. This requires 'kcov' to be installed.");
-    cov_step.dependOn(&coverage_tests.step);
+            lib.linkLibC();
+            lib.linkFramework("CoreData");
+            lib.linkFramework("ApplicationServices");
+            lib.linkFramework("CoreFoundation");
+            lib.linkFramework("Foundation");
+            lib.linkFramework("AppKit");
+            lib.linkSystemLibraryName("objc");
+        },
+        .linux, .freebsd => {
+            lib.linkLibC();
+            lib.linkSystemLibrary("gtk+-3.0");
+        },
+        .freestanding => {
+            if (lib.target.toTarget().isWasm()) {
+                // Things like the image reader require more stack than given by default
+                // TODO: remove once ziglang/zig#12589 is merged
+                lib.stack_size = std.math.max(lib.stack_size orelse 0, 256 * 1024);
+                if (lib.build_mode == .ReleaseSmall) {
+                    lib.strip = true;
+                }
+            } else {
+                return error.UnsupportedOs;
+            }
+        },
+        else => {
+            // TODO: use the GLES backend as long as the windowing system is supported
+            // but the UI library isn't
+            return error.UnsupportedOs;
+        },
+    }
 }
+
+const THIS_DIR = std.fs.path.dirname(@src().file).? ++ std.fs.path.sep_str;
