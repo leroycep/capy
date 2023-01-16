@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const pkg = std.build.Pkg{
+pub const pkg = std.build.Pkg{
     .name = "capy",
     .source = std.build.FileSource{ .path = THIS_DIR ++ "/src/main.zig" },
     .dependencies = &.{zigimg},
