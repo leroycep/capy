@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const pkg = std.build.Pkg{
     .name = "capy",
-    .source = std.build.FileSource{ .path = THIS_DIR ++ "/src/main.zig" },
+    .source = std.build.FileSource{ .path = thisDir() ++ "/src/main.zig" },
     .dependencies = &.{zigimg},
 };
 
@@ -79,4 +79,6 @@ pub fn build(b: *std.build.Builder) !void {
     }
 }
 
-const THIS_DIR = std.fs.path.dirname(@src().file).? ++ std.fs.path.sep_str;
+pub fn thisDir() []const u8 {
+    return std.fs.path.dirname(@src().file).? ++ std.fs.path.sep_str;
+}
